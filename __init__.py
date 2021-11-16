@@ -1,3 +1,5 @@
+import logging
+import typing
 from typing import Dict
 import json
 import aiohttp
@@ -12,6 +14,10 @@ class UnauthorizedError(Exception):
     pass
 
 
+class SessionError(Exception):
+    pass
+
+
 class VWSession:
 
     def __init__(self, email, password):
@@ -20,32 +26,63 @@ class VWSession:
         :param email: VW ID email address (user name)
         :param password: VW ID Password
         """
-        self.session = aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar())
+        self.session: typing.Optional[aiohttp.ClientSession] = None
         self.email = email
         self.password = password
         self.global_config = None
         self.token_timestamp = 0
         self.tokens = {}
+        self.logged_in = False
 
     def clear(self):
         """
         Clears the current sessions cookies
         :return: None
         """
-        self.session.cookie_jar.clear()
+        if self.session is None:
+            raise SessionError("No active session")
+
+        if self.session is not None:
+            self.session.cookie_jar.clear()
+
+    async def log_out(self):
+        if self.session is None:
+            raise SessionError("No active session")
+        if not self.logged_in:
+            raise SessionError("Not logged in")
+
+        csrf = self.session.cookie_jar.filter_cookies(URL(VW_HOST)).get("csrf_token").value
+        r = await self.session.get(f"{LOGOUT_URL}?_csrf={csrf}", timeout=HTTP_TIMEOUT)
+        r.close()
+        self.logged_in = False
 
     async def log_in(self):
         """
         Log in using the VW ID. Raises an exception on error
         :return: None
         """
-        # Clear previous cookies
-        self.clear()
-        # Start Session
-        r = await self.session.get(LOGIN_URL, timeout=HTTP_TIMEOUT)
-        if r.status != 200:
-            raise UnauthorizedError(f"Unexpected return code {r.status}")
-        soup = BeautifulSoup(await r.text(), 'html.parser')
+        if self.logged_in:
+            try:
+                await self.log_out()
+            except Exception as e:
+                # Don't let an unsuccessful logout block our login attempt
+                logging.warning(f"Couldn't log-out during log-in: {repr(e)}")
+                self.logged_in = False
+
+        # Clear client session
+        if self.session is not None:
+            await self.session.close()
+            self.session = None
+
+        self.session = aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar())
+
+        # Start VW Session
+        async with self.session.get(LOGIN_URL, timeout=HTTP_TIMEOUT) as r:
+            if r.status != 200:
+                raise UnauthorizedError(f"Unexpected return code {r.status}")
+
+            soup = BeautifulSoup(await r.text(), 'html.parser')
+
         csrf = soup.find(id="csrf").attrs.get("value")
         relay_state = soup.find(id="input_relayState").attrs.get("value")
         hmac = soup.find(id="hmac").attrs.get("value")
@@ -53,10 +90,11 @@ class VWSession:
 
         # Enter email
         params = {"_csrf": csrf, "relayState": relay_state, "hmac": hmac, "email": self.email}
-        r = await self.session.post(VW_IDENTITY_HOST + next_url, params=params, timeout=HTTP_TIMEOUT)
-        if r.status != 200:
-            raise UnauthorizedError(f"Unexpected return code {r.status}")
-        soup = BeautifulSoup(await r.text(), 'html.parser')
+        async with self.session.post(VW_IDENTITY_HOST + next_url, params=params, timeout=HTTP_TIMEOUT) as r:
+            if r.status != 200:
+                raise UnauthorizedError(f"Unexpected return code {r.status}")
+            soup = BeautifulSoup(await r.text(), 'html.parser')
+
         csrf = soup.find(id="csrf").attrs.get("value")
         relay_state = soup.find(id="input_relayState").attrs.get("value")
         hmac = soup.find(id="hmac").attrs.get("value")
@@ -64,13 +102,15 @@ class VWSession:
 
         # Enter password
         params = {"_csrf": csrf, "relayState": relay_state, "hmac": hmac, "email": self.email, "password": self.password}
-        r = await self.session.post(VW_IDENTITY_HOST + next_url, params=params, timeout=HTTP_TIMEOUT, max_redirects=50)
-        if r.status != 200:
-            raise UnauthorizedError(f"Unexpected return code {r.status}")
+        async with self.session.post(VW_IDENTITY_HOST + next_url, params=params, timeout=HTTP_TIMEOUT, max_redirects=50) as r:
+            if r.status != 200:
+                raise UnauthorizedError(f"Unexpected return code {r.status}")
 
         # get global config
-        r = await self.session.get(VW_GLOBAL_CONFIG_URL, timeout=HTTP_TIMEOUT)
-        self.global_config = json.loads(await r.text())
+        async with await self.session.get(VW_GLOBAL_CONFIG_URL, timeout=HTTP_TIMEOUT) as r:
+            self.global_config = json.loads(await r.text())
+
+        self.logged_in = True
 
     async def _get_tokens(self):
         """
@@ -78,22 +118,29 @@ class VWSession:
         :return: None
         """
         # Refresh session by loading the lounge
-        await self.session.get(LOUNGE_URL, timeout=HTTP_TIMEOUT)
+        r = await self.session.get(LOUNGE_URL, timeout=HTTP_TIMEOUT)
+        r.close()
+
         # Get Bearer Token
         csrf = self.session.cookie_jar.filter_cookies(URL(VW_HOST)).get("csrf_token").value
         # used to be: csrf = s.cookies.get("csrf_token")
         headers = {"X-CSRF-TOKEN": csrf}
-        r = await self.session.get(TOKEN_URL, headers=headers, timeout=HTTP_TIMEOUT)
-        if r.status != 200:
-            raise UnauthorizedError(f"Unexpected return code {r.status}")
-        self.token_timestamp = time.time()
-        self.tokens = json.loads(await r.text())
+        async with self.session.get(TOKEN_URL, headers=headers, timeout=HTTP_TIMEOUT) as r:
+            if r.status != 200:
+                raise UnauthorizedError(f"Unexpected return code {r.status}")
+            self.token_timestamp = time.time()
+            self.tokens = json.loads(await r.text())
 
-    async def check_tokens(self):
+    async def check_session(self):
         """
         Checks the validity of the stored tokens and gets new tokens if necessary
         :return: None
         """
+        if self.session is None:
+            raise SessionError("No active session")
+        if not self.logged_in:
+            raise SessionError("Not logged in")
+
         if time.time() - self.token_timestamp > TOKEN_VALIDITY_S:
             await self._get_tokens()
 
@@ -102,23 +149,25 @@ class VWSession:
         Get information about the cars from the API. Queries the "relations" and "lounge" APIs
         :return: Dict {"relations": <output of relations API>, "lounge": <output of the lounge API>}
         """
-        await self.check_tokens()
+        await self.check_session()
         # Get lounge data
         headers = {"Authorization": "Bearer " + self.tokens.get("access_token")}
-        lounge_request = await self.session.get(LOUNGE_CARS_URL, headers=headers, timeout=HTTP_TIMEOUT)
-        if lounge_request.status != 200:
-            raise UnauthorizedError(f"Unexpected return code from lounge API:  {lounge_request.status}")
+        async with self.session.get(LOUNGE_CARS_URL, headers=headers, timeout=HTTP_TIMEOUT) as lounge_request:
+            if lounge_request.status != 200:
+                raise UnauthorizedError(f"Unexpected return code from lounge API:  {lounge_request.status}")
+            lounge_request_text = await lounge_request.text()
 
         # Get relations data
         headers["traceId"] = "1915c3f8-614d-4c4b-a6ac-a05fc52608a8"
-        relations_request = await self.session.get(RELATIONS_URL_V2, headers=headers, timeout=HTTP_TIMEOUT)
-        if relations_request.status != 200:
-            print(relations_request.content)
-            raise UnauthorizedError(f"Unexpected return code from Relations API: {relations_request.status}")
+        async with self.session.get(RELATIONS_URL_V2, headers=headers, timeout=HTTP_TIMEOUT) as relations_request:
+            if relations_request.status != 200:
+
+                raise UnauthorizedError(f"Unexpected return code from Relations API: {relations_request.status}")
+            relations_request_text = await relations_request.text()
 
         return {
-            "lounge": json.loads(await lounge_request.text()),
-            "relations": json.loads(await relations_request.text()).get("relations")
+            "lounge": json.loads(lounge_request_text),
+            "relations": json.loads(relations_request_text).get("relations")
         }
 
     async def get_comm_id_by_comm_nr(self, comm_nr: str) -> str:
@@ -132,14 +181,13 @@ class VWSession:
         except KeyError:
             raise ValueError("Couldn't load list of valid BIDs")
 
-        await self.check_tokens()
+        await self.check_session()
         headers = {"Authorization": "Bearer " + self.tokens.get("access_token")}
         for year in BID_SEARCH_YEARS:
             for bid in valid_bids:
-                r = await self.session.get(VEHICLE_DATA_PATH + bid + str(year) + comm_nr, headers=headers, timeout=HTTP_TIMEOUT)
-                if r.status == 200:
-                    return f"{comm_nr}-{bid}-{year}"
-
+                async with self.session.get(VEHICLE_DATA_PATH + bid + str(year) + comm_nr, headers=headers, timeout=HTTP_TIMEOUT) as r:
+                    if r.status == 200:
+                        return f"{comm_nr}-{bid}-{year}"
         raise ValueError("Couldn't find CommID")
 
     async def add_relation_by_comm_id(self, comm_id: str):
@@ -148,15 +196,15 @@ class VWSession:
         :param comm_id: Commissioning ID e.g. ABC123-184-2021
         :return: None
         """
-        await self.check_tokens()
+        await self.check_session()
         headers = {"Authorization": "Bearer " + self.tokens.get("access_token"),
                    "traceId": "1915c3f8-614d-4c4b-a6ac-a05fc52608a8",
                    "Content-Type": "application/json"}
         payload = {"vehicleNickname": comm_id, "vehicle": {"commissionId": comm_id}}
 
-        add_request = await self.session.post(RELATIONS_URL_V1, data=json.dumps(payload), headers=headers, timeout=HTTP_TIMEOUT)
-        if add_request.status != 201:
-            raise UnauthorizedError(f"Couldn't add car ({add_request.status}): {await add_request.text()}")
+        async with self.session.post(RELATIONS_URL_V1, data=json.dumps(payload), headers=headers, timeout=HTTP_TIMEOUT) as add_request:
+            if add_request.status != 201:
+                raise UnauthorizedError(f"Couldn't add car ({add_request.status}): {await add_request.text()}")
 
     async def remove_relation_by_comm_id(self, comm_id: str):
         """
@@ -164,12 +212,11 @@ class VWSession:
         :param comm_id: Commissioning ID e.g. ABC123-184-2021
         :return: None
         """
-        await self.check_tokens()
+        await self.check_session()
         headers = {"Authorization": "Bearer " + self.tokens.get("access_token"),
                    "traceId": "1915c3f8-614d-4c4b-a6ac-a05fc52608a8",
                    "Content-Type": "application/json"}
 
-        rem_request = await self.session.delete(f"{MY_VEHICLES_URL}?commissionId={comm_id}", headers=headers,
-                                              timeout=HTTP_TIMEOUT)
-        if not rem_request.ok:
-            raise ValueError(f"API returned ({rem_request.status}): {await rem_request.text()}")
+        async with self.session.delete(f"{MY_VEHICLES_URL}?commissionId={comm_id}", headers=headers, timeout=HTTP_TIMEOUT) as rem_request:
+            if not rem_request.ok:
+                raise ValueError(f"API returned ({rem_request.status}): {await rem_request.text()}")

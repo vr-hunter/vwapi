@@ -3,6 +3,7 @@ VEHICLE_DATA_PATH = "https://myvw-gvf-proxy.apps.emea.vwapps.io/vehicleData/de-D
 MY_VEHICLES_URL = "https://vum.apps.emea.vwapps.io/users/me/vehicles"
 LOUNGE_URL = "https://www.volkswagen.de/de/besitzer-und-nutzer/myvolkswagen/volkswagen-lounge.html"
 LOGIN_URL = "https://www.volkswagen.de/app/authproxy/login?fag=vw-de,vw-ag-direct-sales,vwag-weconnect&scope-vw-de=profile,address,phone,carConfigurations,dealers,cars,vin,profession&scope-vw-ag-direct-sales=address,phone,profile&scope-vwag-weconnect=openid,mbb&prompt-vw-ag-direct-sales=none&prompt-vwag-weconnect=none&redirectUrl=https://www.volkswagen.de/de/besitzer-und-nutzer/myvolkswagen/volkswagen-lounge.html"
+LOGOUT_URL = "https://www.volkswagen.de/app/authproxy/logout"
 TOKEN_URL = "https://www.volkswagen.de/app/authproxy/vw-de/tokens"
 LOUNGE_CARS_URL = "https://myvwde.cloud.wholesaleservices.de/api/waiting-lounge/cars"
 TBO_CARS_URL = "https://myvwde.cloud.wholesaleservices.de/api/tbo/cars"
