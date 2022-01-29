@@ -6,6 +6,7 @@ import aiohttp
 from bs4 import BeautifulSoup
 from yarl import URL
 import time
+import re
 
 from .constants import *
 
@@ -95,10 +96,20 @@ class VWSession:
                 raise UnauthorizedError(f"Unexpected return code {r.status}")
             soup = BeautifulSoup(await r.text(), 'html.parser')
 
-        csrf = soup.find(id="csrf").attrs.get("value")
-        relay_state = soup.find(id="input_relayState").attrs.get("value")
-        hmac = soup.find(id="hmac").attrs.get("value")
-        next_url = soup.find(id="credentialsForm").attrs.get("action")
+        #csrf = soup.find(id="csrf").attrs.get("value")
+        #relay_state = soup.find(id="input_relayState").attrs.get("value")
+        #hmac = soup.find(id="hmac").attrs.get("value")
+        #next_url = soup.find(id="credentialsForm").attrs.get("action")
+
+        script_field = soup.select_one('script:-soup-contains("templateModel:")').string
+
+
+        templateModel = json.loads(re.search(r"templateModel\s*:\s*({.*})\s*,\s*\n",script_field).group(1))
+        hmac = templateModel["hmac"]
+        relay_state = templateModel["relayState"]
+        csrf = re.search(r"csrf_token\s*:\s*[\"\'](.*)[\"\']\s*,?\s*\n", script_field).group(1)
+        next_url = f"/signin-service/v1/{templateModel['clientLegalEntityModel']['clientId']}/{templateModel['postAction']}/"
+        # next url stays the same
 
         # Enter password
         params = {"_csrf": csrf, "relayState": relay_state, "hmac": hmac, "email": self.email, "password": self.password}
